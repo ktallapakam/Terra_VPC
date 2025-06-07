@@ -149,20 +149,122 @@ resource "aws_route_table_association" "private_assoc-02" {
 }
 
 
-resource "aws_security_group" "public-sec-01" {
+resource "aws_security_group" "sec-01" {
+  name        = "sec-01"
+  description = "Allow SSH and HTTP"
   vpc_id      = aws_vpc.my-vpc-01.id
+
+  ingress {
+    description = "Allow SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Caution: Open to all
+  }
+
+  ingress {
+    description = "Allow HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "allow_tls_ipv4" {
-  security_group_id = aws_security_group.public-sec-01.id
-  cidr_ipv4         = aws_vpc.main.cidr_block
-  from_port         = 443
-  ip_protocol       = "tcp"
-  to_port           = 443
+resource "aws_iam_role" "ssm_role" {
+  name = "ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      },
+      Action = "sts:AssumeRole"
+    }]
+  })
 }
 
-resource "aws_vpc_security_group_egress_rule" "allow_all_traffic_ipv4" {
-  security_group_id = aws_security_group.public-sec-01.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1" # semantically equivalent to all ports
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
+
+resource "aws_iam_instance_profile" "ssm_instance_profile" {
+  name = "ssm-instance-profile"
+  role = aws_iam_role.ssm_role.name
+}
+
+resource "aws_instance" "docker_host" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t2.micro"
+  subnet_id              = aws_subnet.my-public-01.id
+  associate_public_ip_address = true
+  vpc_security_group_ids = [aws_security_group.sec-01.id]
+  iam_instance_profile   = aws_iam_instance_profile.ssm_instance_profile.name
+  key_name               = "Terra"
+
+  tags = {
+    Name = "DockerHostViaSSM"
+  }
+}
+
+
+resource "aws_ssm_document" "install_docker_script" {
+  name          = "InstallDocker"
+  document_type = "Command"
+
+  content = jsonencode({
+    schemaVersion = "2.2",
+    description   = "Install Docker on Ubuntu EC2",
+    mainSteps = [
+      {
+        action = "aws:runShellScript",
+        name   = "installDocker",
+        inputs = {
+          runCommand = [
+            "sudo apt-get update",
+            "sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common",
+            "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -",
+            "sudo add-apt-repository \"deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\"",
+            "sudo apt-get update",
+            "sudo apt-get install -y docker-ce",
+            "sudo usermod -aG docker ubuntu",
+            "sudo systemctl enable docker",
+            "sudo systemctl start docker"
+          ]
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_ssm_association" "run_install_docker" {
+  name       = aws_ssm_document.install_docker_script.name
+
+  targets {
+    key    = "InstanceIds"
+    values = [aws_instance.docker_host.id]
+  }
+
+  depends_on = [aws_instance.docker_host]
+}
+
+
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+}
+
+output "docker_host_public_ip" {
+  description = "Public IP of the Docker host EC2 instance"
+  value       = aws_instance.docker_host.public_ip
+}
+
+
